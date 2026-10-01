@@ -5,7 +5,7 @@ Elasticsearch.
 See README.md or https://github.com/shirosaidev/stocksight
 for more information.
 
-Copyright (C) Chris Park 2018
+Copyright (C) Chris Park 2018-2020
 stocksight is released under the Apache 2.0 license. See
 LICENSE for the full license text.
 """
@@ -16,17 +16,13 @@ import re
 import argparse
 import logging
 import sys
-try:
-    from elasticsearch5 import Elasticsearch
-except ImportError:
-    from elasticsearch import Elasticsearch
+from elasticsearch import Elasticsearch
 from random import randint
 
 # import elasticsearch host
 from config import elasticsearch_host, elasticsearch_port, elasticsearch_user, elasticsearch_password
 
-
-STOCKSIGHT_VERSION = '0.1-b.5'
+from sentiment import STOCKSIGHT_VERSION
 __version__ = STOCKSIGHT_VERSION
 
 # url to fetch stock price from, SYMBOL will be replaced with symbol from cli args
@@ -184,18 +180,14 @@ if __name__ == '__main__':
             color = '35m'
 
         banner = """\033[%s
-
-                 /$$                         /$$                 /$$           /$$         /$$    
-                | $$                        | $$                |__/          | $$        | $$    
-      /$$$$$$$ /$$$$$$    /$$$$$$   /$$$$$$$| $$   /$$  /$$$$$$$ /$$  /$$$$$$ | $$$$$$$  /$$$$$$  
-     /$$_____/|_  $$_/   /$$__  $$ /$$_____/| $$  /$$/ /$$_____/| $$ /$$__  $$| $$__  $$|_  $$_/  
-    |  $$$$$$   | $$    | $$  \ $$| $$      | $$$$$$/ |  $$$$$$ | $$| $$  \ $$| $$  \ $$  | $$    
-     \____  $$  | $$ /$$| $$  | $$| $$      | $$_  $$  \____  $$| $$| $$  | $$| $$  | $$  | $$ /$$
-     /$$$$$$$/  |  $$$$/|  $$$$$$/|  $$$$$$$| $$ \  $$ /$$$$$$$/| $$|  $$$$$$$| $$  | $$  |  $$$$/
-    |_______/    \___/   \______/  \_______/|__/  \__/|_______/ |__/ \____  $$|__/  |__/   \___/  
-                                                                     /$$  \ $$                    
-                           :) = +$   :( = -$                        |  $$$$$$/                    
-                                                                     \______/  v%s
+       _                     _                 
+     _| |_ _           _   _| |_ _     _   _   
+    |   __| |_ ___ ___| |_|   __|_|___| |_| |_ 
+    |__   |  _| . |  _| '_|__   | | . |   |  _|
+    |_   _|_| |___|___|_,_|_   _|_|_  |_|_|_|  
+      |_|                   |_|   |___|                
+          :) = +$   :( = -$    v%s
+     https://github.com/shirosaidev/stocksight
             \033[0m""" % (color, STOCKSIGHT_VERSION)
         print(banner + '\n')
 

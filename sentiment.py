@@ -6,7 +6,7 @@ Elasticsearch.
 See README.md or https://github.com/shirosaidev/stocksight
 for more information.
 
-Copyright (C) Chris Park 2018
+Copyright (C) Chris Park 2018-2020
 stocksight is released under the Apache 2.0 license. See
 LICENSE for the full license text.
 """
@@ -15,11 +15,11 @@ import sys
 import json
 import time
 import re
-import unicodedata
 import requests
 import nltk
 import argparse
 import logging
+import string
 try:
     import urllib.parse as urlparse
 except ImportError:
@@ -29,28 +29,23 @@ from tweepy import API, Stream, OAuthHandler, TweepError
 from textblob import TextBlob
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from bs4 import BeautifulSoup
-try:
-    from elasticsearch5 import Elasticsearch
-except ImportError:
-    from elasticsearch import Elasticsearch
-from random import randint
+from elasticsearch import Elasticsearch
+from random import randint, randrange
 from datetime import datetime
+from newspaper import Article, ArticleException
 
 # import elasticsearch host, twitter keys and tokens
 from config import *
 
 
-STOCKSIGHT_VERSION = '0.1-b.5'
+STOCKSIGHT_VERSION = '0.1-b.12'
 __version__ = STOCKSIGHT_VERSION
 
 IS_PY3 = sys.version_info >= (3, 0)
 
-if IS_PY3:
-    unicode = str
-
-# create instance of elasticsearch
-es = Elasticsearch(hosts=[{'host': elasticsearch_host, 'port': elasticsearch_port}],
-                   http_auth=(elasticsearch_user, elasticsearch_password))
+if not IS_PY3:
+    print("Sorry, stocksight requires Python 3.")
+    sys.exit(1)
 
 # sentiment text-processing url
 sentimentURL = 'http://text-processing.com/api/sentiment/'
@@ -61,37 +56,47 @@ tweet_ids = []
 # file to hold twitter user ids
 twitter_users_file = './twitteruserids.txt'
 
+prev_time = time.time()
+sentiment_avg = [0.0,0.0,0.0]
+
 
 class TweetStreamListener(StreamListener):
 
+    def __init__(self):
+        self.count = 0
+        self.count_filtered = 0
+        self.filter_ratio = 0
+
     # on success
     def on_data(self, data):
-
         try:
+            self.count+=1
             # decode json
             dict_data = json.loads(data)
 
-            logger.debug(dict_data)
+            print("\n------------------------------> (tweets: %s, filtered: %s, filter-ratio: %s)" \
+                % (self.count, self.count_filtered, str(round(self.count_filtered/self.count*100,2))+"%"))
+            logger.debug('tweet data: ' + str(dict_data))
 
-            # clean up tweet text
-            #text = unicodedata.normalize(
-            #    'NFKD', dict_data["text"]).encode('ascii', 'ignore')
             text = dict_data["text"]
             if text is None:
                 logger.info("Tweet has no relevant text, skipping")
+                self.count_filtered+=1
                 return True
 
             # grab html links from tweet
-            #tweet_urls = re.search("http\S+", text)
+            tweet_urls = []
+            if args.linksentiment:
+                tweet_urls = re.findall(r'(https?://[^\s]+)', text)
 
-            # clean up tweet text more
-            text = text.replace("\n", " ")
-            text = re.sub(r"http\S+", "", text)
-            text = re.sub(r"&.*?;", "", text)
-            text = re.sub(r"<.*?>", "", text)
-            text = text.replace("RT", "")
-            text = text.replace(u"…", "")
-            text = text.strip()
+            # clean up tweet text
+            textclean = clean_text(text)
+
+            # check if tweet has no valid text
+            if textclean == "":
+                logger.info("Tweet does not cotain any valid text after cleaning, not adding")
+                self.count_filtered+=1
+                return True
 
             # get date when tweet was created
             created_date = time.strftime(
@@ -104,12 +109,12 @@ class TweetStreamListener(StreamListener):
             friends = int(dict_data.get("user", {}).get("friends_count"))
             followers = int(dict_data.get("user", {}).get("followers_count"))
             statuses = int(dict_data.get("user", {}).get("statuses_count"))
-            text_filtered = str(text)
+            text_filtered = str(textclean)
             tweetid = int(dict_data.get("id"))
-            text_raw = unicode(dict_data.get("text"))
+            text_raw = str(dict_data.get("text"))
 
             # output twitter data
-            print("\n------------------------------")
+            print("\n<------------------------------")
             print("Tweet Date: " + created_date)
             print("Screen Name: " + screen_name)
             print("Location: " + location)
@@ -125,7 +130,25 @@ class TweetStreamListener(StreamListener):
             text_for_tokens = re.sub(
                 r"[\%|\$|\.|\,|\!|\:|\@]|\(|\)|\#|\+|(``)|('')|\?|\-", "", text_filtered)
             tokens = nltk.word_tokenize(text_for_tokens)
+            # convert to lower case
+            tokens = [w.lower() for w in tokens]
+            # remove punctuation from each word
+            table = str.maketrans('', '', string.punctuation)
+            stripped = [w.translate(table) for w in tokens]
+            # remove remaining tokens that are not alphabetic
+            tokens = [w for w in stripped if w.isalpha()]
+            # filter out stop words
+            stop_words = set(nltk.corpus.stopwords.words('english'))
+            tokens = [w for w in tokens if not w in stop_words]
+            # remove words less than 3 characters
+            tokens = [w for w in tokens if not len(w) < 3]
             print("NLTK Tokens: " + str(tokens))
+
+            # check for min token length
+            if len(tokens) < 5:
+                logger.info("Tweet does not contain min. number of tokens, not adding")
+                self.count_filtered+=1
+                return True
 
             # do some checks before adding to elasticsearch and crawling urls in tweet
             if friends == 0 or \
@@ -134,53 +157,90 @@ class TweetStreamListener(StreamListener):
                             text == "" or \
                             tweetid in tweet_ids:
                 logger.info("Tweet doesn't meet min requirements, not adding")
+                self.count_filtered+=1
                 return True
 
             # check ignored tokens from config
             for t in nltk_tokens_ignored:
                 if t in tokens:
                     logger.info("Tweet contains token from ignore list, not adding")
+                    self.count_filtered+=1
                     return True
             # check required tokens from config
             tokenspass = False
+            tokensfound = 0
             for t in nltk_tokens_required:
                 if t in tokens:
-                    tokenspass = True
-                    break
+                    tokensfound += 1
+                    if tokensfound == nltk_min_tokens:
+                        tokenspass = True
+                        break
             if not tokenspass:
-                logger.info("Tweet does not contain token from required list, not adding")
+                logger.info("Tweet does not contain token from required list or min required, not adding")
+                self.count_filtered+=1
                 return True
 
-            # strip out hashtags for language processing
-            tweet = re.sub(r"[#|@|\$]\S+", "", text)
-            tweet.strip()
+            # clean text for sentiment analysis
+            text_clean = clean_text_sentiment(text_filtered)
+
+            # check if tweet has no valid text
+            if text_clean == "":
+                logger.info("Tweet does not cotain any valid text after cleaning, not adding")
+                self.count_filtered+=1
+                return True
+
+            print("Tweet Clean Text (sentiment): " + text_clean)
 
             # get sentiment values
-            polarity, subjectivity, sentiment = sentiment_analysis(tweet)
+            polarity, subjectivity, sentiment = sentiment_analysis(text_clean)
 
             # add tweet_id to list
             tweet_ids.append(dict_data["id"])
 
-            # remove hashtags for elasticsearch
-            #text_filtered = re.sub(r"[#|@|\$]\S+", "", text_filtered)
+            # get sentiment for tweet 
+            if len(tweet_urls) > 0:
+                tweet_urls_polarity = 0
+                tweet_urls_subjectivity = 0
+                for url in tweet_urls:
+                    res = tweeklink_sentiment_analysis(url)
+                    if res is None:
+                        continue
+                    pol, sub, sen = res
+                    tweet_urls_polarity = (tweet_urls_polarity + pol) / 2
+                    tweet_urls_subjectivity = (tweet_urls_subjectivity + sub) / 2
+                    if sentiment == "positive" or sen == "positive":
+                        sentiment = "positive"
+                    elif sentiment == "negative" or sen == "negative":
+                        sentiment = "negative"
+                    else:
+                        sentiment = "neutral"
+
+                # calculate average polarity and subjectivity from tweet and tweet links
+                if tweet_urls_polarity > 0:
+                    polarity = (polarity + tweet_urls_polarity) / 2
+                if tweet_urls_subjectivity > 0:
+                    subjectivity = (subjectivity + tweet_urls_subjectivity) / 2
+            
 
             logger.info("Adding tweet to elasticsearch")
             # add twitter data and sentiment info to elasticsearch
             es.index(index=args.index,
-                     doc_type="tweet",
-                     body={"author": screen_name,
-                           "location": location,
-                           "language": language,
-                           "friends": friends,
-                           "followers": followers,
-                           "statuses": statuses,
-                           "date": created_date,
-                           "message": text_filtered,
-                           "tweet_id": tweetid,
-                           "polarity": polarity,
-                           "subjectivity": subjectivity,
-                           "sentiment": sentiment})
+                    doc_type="tweet",
+                    body={"author": screen_name,
+                        "location": location,
+                        "language": language,
+                        "friends": friends,
+                        "followers": followers,
+                        "statuses": statuses,
+                        "date": created_date,
+                        "message": text_filtered,
+                        "tweet_id": tweetid,
+                        "polarity": polarity,
+                        "subjectivity": subjectivity,
+                        "sentiment": sentiment})
 
+            # randomly sleep to stagger request time
+            time.sleep(randrange(2,5))
             return True
 
         except Exception as e:
@@ -189,21 +249,29 @@ class TweetStreamListener(StreamListener):
 
     # on failure
     def on_error(self, status_code):
-        logger.error("Got an error with status code: %s" % status_code)
+        logger.error("Got an error with status code: %s (will try again later)" % status_code)
+        # randomly sleep to stagger request time
+        time.sleep(randrange(2,30))
         return True
 
     # on timeout
     def on_timeout(self):
-        logger.warning("Timeout...")
+        logger.warning("Timeout... (will try again later)")
+        # randomly sleep to stagger request time
+        time.sleep(randrange(2,30))
         return True
 
 
 class NewsHeadlineListener:
+
     def __init__(self, url=None, frequency=120):
         self.url = url
         self.headlines = []
         self.followedlinks = []
         self.frequency = frequency
+        self.count = 0
+        self.count_filtered = 0
+        self.filter_ratio = 0
 
         while True:
             new_headlines = self.get_news_headlines(self.url)
@@ -212,10 +280,12 @@ class NewsHeadlineListener:
             for htext, htext_url in new_headlines:
                 if htext not in self.headlines:
                     self.headlines.append(htext)
+                    self.count+=1
 
                     datenow = datetime.utcnow().isoformat()
                     # output news data
-                    print("\n------------------------------")
+                    print("\n------------------------------> (news headlines: %s, filtered: %s, filter-ratio: %s)" \
+                        % (self.count, self.count_filtered, str(round(self.count_filtered/self.count*100,2))+"%"))
                     print("Date: " + datenow)
                     print("News Headline: " + htext)
                     print("Location (url): " + htext_url)
@@ -226,10 +296,17 @@ class NewsHeadlineListener:
                     tokens = nltk.word_tokenize(text_for_tokens)
                     print("NLTK Tokens: " + str(tokens))
 
+                    # check for min token length
+                    if len(tokens) < 5:
+                        logger.info("Text does not contain min. number of tokens, not adding")
+                        self.count_filtered+=1
+                        continue
+
                     # check ignored tokens from config
                     for t in nltk_tokens_ignored:
                         if t in tokens:
                             logger.info("Text contains token from ignore list, not adding")
+                            self.count_filtered+=1
                             continue
                     # check required tokens from config
                     tokenspass = False
@@ -239,6 +316,7 @@ class NewsHeadlineListener:
                             break
                     if not tokenspass:
                         logger.info("Text does not contain token from required list, not adding")
+                        self.count_filtered+=1
                         continue
 
                     # get sentiment values
@@ -247,13 +325,13 @@ class NewsHeadlineListener:
                     logger.info("Adding news headline to elasticsearch")
                     # add news headline data and sentiment info to elasticsearch
                     es.index(index=args.index,
-                             doc_type="newsheadline",
-                             body={"date": datenow,
-                                   "location": htext_url,
-                                   "message": htext,
-                                   "polarity": polarity,
-                                   "subjectivity": subjectivity,
-                                   "sentiment": sentiment})
+                            doc_type="newsheadline",
+                            body={"date": datenow,
+                                "location": htext_url,
+                                "message": htext,
+                                "polarity": polarity,
+                                "subjectivity": subjectivity,
+                                "sentiment": sentiment})
 
             logger.info("Will get news headlines again in %s sec..." % self.frequency)
             time.sleep(self.frequency)
@@ -331,13 +409,34 @@ def get_page_text(url):
         pass
 
 
+def clean_text(text):
+    # clean up text
+    text = text.replace("\n", " ")
+    text = re.sub(r"https?\S+", "", text)
+    text = re.sub(r"&.*?;", "", text)
+    text = re.sub(r"<.*?>", "", text)
+    text = text.replace("RT", "")
+    text = text.replace(u"…", "")
+    text = text.strip()
+    return text
+
+
+def clean_text_sentiment(text):
+    # clean up text for sentiment analysis
+    text = re.sub(r"[#|@]\S+", "", text)
+    text = text.strip()
+    return text
+
+
 def get_sentiment_from_url(text, sentimentURL):
+    # get sentiment from text processing website
     payload = {'text': text}
 
     try:
+        #logger.debug(text)
         post = requests.post(sentimentURL, data=payload)
-        logger.debug(post.status_code)
-        logger.debug(post.text)
+        #logger.debug(post.status_code)
+        #logger.debug(post.text)
     except requests.exceptions.RequestException as re:
         logger.error("Exception: requests exception getting sentiment from url caused by %s" % re)
         raise
@@ -348,11 +447,10 @@ def get_sentiment_from_url(text, sentimentURL):
         return None
 
     response = post.json()
-    logger.debug(response)
 
-    # neg = response['probability']['neg']
-    # neutral = response['probability']['neutral']
-    # pos = response['probability']['pos']
+    neg = response['probability']['neg']
+    pos = response['probability']['pos']
+    neu = response['probability']['neutral']
     label = response['label']
 
     # determine if sentiment is positive, negative, or neutral
@@ -363,7 +461,7 @@ def get_sentiment_from_url(text, sentimentURL):
     else:
         sentiment = "positive"
 
-    return sentiment
+    return sentiment, neg, pos, neu
 
 
 def sentiment_analysis(text):
@@ -375,7 +473,14 @@ def sentiment_analysis(text):
     """
 
     # pass text into sentiment url
-    sentiment_url = get_sentiment_from_url(text, sentimentURL)
+    if args.websentiment:
+        ret = get_sentiment_from_url(text, sentimentURL)
+        if ret is None:
+            sentiment_url = None
+        else:
+            sentiment_url, neg_url, pos_url, neu_url = ret
+    else:
+        sentiment_url = None
 
     # pass text into TextBlob
     text_tb = TextBlob(text)
@@ -384,44 +489,96 @@ def sentiment_analysis(text):
     analyzer = SentimentIntensityAnalyzer()
     text_vs = analyzer.polarity_scores(text)
 
+    # determine sentiment from our sources
     if sentiment_url is None:
-        if text_tb.sentiment.polarity <= 0 and text_vs['compound'] <= -0.5:
-            sentiment = "negative"  # very negative
-        elif text_tb.sentiment.polarity <= 0 and text_vs['compound'] <= -0.1:
-            sentiment = "negative"  # somewhat negative
-        elif text_tb.sentiment.polarity == 0 and text_vs['compound'] > -0.1 and text_vs['compound'] < 0.1:
-            sentiment = "neutral"
-        elif text_tb.sentiment.polarity >= 0 and text_vs['compound'] >= 0.1:
-            sentiment = "positive"  # somewhat positive
-        elif text_tb.sentiment.polarity > 0 and text_vs['compound'] >= 0.1:
-            sentiment = "positive"  # very positive
+        if text_tb.sentiment.polarity < 0 and text_vs['compound'] <= -0.05:
+            sentiment = "negative"
+        elif text_tb.sentiment.polarity > 0 and text_vs['compound'] >= 0.05:
+            sentiment = "positive"
         else:
             sentiment = "neutral"
     else:
-        if text_tb.sentiment.polarity < 0 and text_vs['compound'] <= -0.1 and sentiment_url == "negative":
-            sentiment = "negative"  # very negative
-        elif text_tb.sentiment.polarity <= 0 and text_vs['compound'] < 0 and sentiment_url == "neutral":
-            sentiment = "negative"  # somewhat negative
-        elif text_tb.sentiment.polarity >= 0 and text_vs['compound'] > 0 and sentiment_url == "neutral":
-            sentiment = "positive"  # somewhat positive
-        elif text_tb.sentiment.polarity > 0 and text_vs['compound'] >= 0.1 and sentiment_url == "positive":
-            sentiment = "positive"  # very positive
+        if text_tb.sentiment.polarity < 0 and text_vs['compound'] <= -0.05 and sentiment_url == "negative":
+            sentiment = "negative"
+        elif text_tb.sentiment.polarity > 0 and text_vs['compound'] >= 0.05 and sentiment_url == "positive":
+            sentiment = "positive"
         else:
             sentiment = "neutral"
 
     # calculate average polarity from TextBlob and VADER
     polarity = (text_tb.sentiment.polarity + text_vs['compound']) / 2
+
     # output sentiment polarity
-    print("Sentiment Polarity: " + str(polarity))
+    print("************")
+    print("Sentiment Polarity: " + str(round(polarity, 3)))
 
     # output sentiment subjectivity (TextBlob)
-    print("Sentiment Subjectivity: " + str(text_tb.sentiment.subjectivity))
+    print("Sentiment Subjectivity: " + str(round(text_tb.sentiment.subjectivity, 3)))
 
     # output sentiment
     print("Sentiment (url): " + str(sentiment_url))
     print("Sentiment (algorithm): " + str(sentiment))
+    print("Overall sentiment (textblob): ", text_tb.sentiment) 
+    print("Overall sentiment (vader): ", text_vs) 
+    print("sentence was rated as ", round(text_vs['neg']*100, 3), "% Negative") 
+    print("sentence was rated as ", round(text_vs['neu']*100, 3), "% Neutral") 
+    print("sentence was rated as ", round(text_vs['pos']*100, 3), "% Positive") 
+    print("************")
 
     return polarity, text_tb.sentiment.subjectivity, sentiment
+
+
+def tweeklink_sentiment_analysis(url):
+    # get text summary of tweek link web page and run sentiment analysis on it
+    try:
+        logger.info('Following tweet link %s to get sentiment..' % url)
+        article = Article(url)
+        article.download()
+        article.parse()
+        # check if twitter web page
+        if "Tweet with a location" in article.text:
+            logger.info('Link to Twitter web page, skipping')
+            return None
+        article.nlp()
+        tokens = article.keywords
+        print("Tweet link nltk tokens:", tokens)
+
+        # check for min token length
+        if len(tokens) < 5:
+            logger.info("Tweet link does not contain min. number of tokens, not adding")
+            return None
+        # check ignored tokens from config
+        for t in nltk_tokens_ignored:
+            if t in tokens:
+                logger.info("Tweet link contains token from ignore list, not adding")
+                return None
+        # check required tokens from config
+        tokenspass = False
+        tokensfound = 0
+        for t in nltk_tokens_required:
+            if t in tokens:
+                tokensfound += 1
+                if tokensfound == nltk_min_tokens:
+                    tokenspass = True
+                    break
+        if not tokenspass:
+            logger.info("Tweet link does not contain token from required list or min required, not adding")
+            return None
+
+        summary = article.summary
+        if summary == '':
+            logger.info('No text found in tweet link url web page')
+            return None
+        summary_clean = clean_text(summary)
+        summary_clean = clean_text_sentiment(summary_clean)
+        print("Tweet link Clean Summary (sentiment): " + summary_clean)
+        polarity, subjectivity, sentiment = sentiment_analysis(summary_clean)
+        
+        return polarity, subjectivity, sentiment
+
+    except ArticleException as e:
+        logger.warning('Exception: error getting text on Twitter link caused by: %s' % e)
+        return None
 
 
 def get_twitter_users_from_url(url):
@@ -459,7 +616,7 @@ def get_twitter_users_from_file(file):
     try:
         f = open(file, "rt", encoding='utf-8')
         for line in f.readlines():
-            u = int(line.strip())
+            u = line.strip()
             twitter_users.append(u)
         logger.debug(twitter_users)
         f.close()
@@ -476,20 +633,32 @@ if __name__ == '__main__':
                         help="Index name for Elasticsearch (default: stocksight)")
     parser.add_argument("-d", "--delindex", action="store_true",
                         help="Delete existing Elasticsearch index first")
+    parser.add_argument("-s", "--symbol", metavar="SYMBOL", required=True,
+                        help="Stock symbol you are interesed in searching for, example: TSLA")
     parser.add_argument("-k", "--keywords", metavar="KEYWORDS",
                         help="Use keywords to search for in Tweets instead of feeds. "
                              "Separated by comma, case insensitive, spaces are ANDs commas are ORs. "
                              "Example: TSLA,'Elon Musk',Musk,Tesla,SpaceX")
+    parser.add_argument("-a", "--addtokens", action="store_true",
+                        help="Add nltk tokens required from config to keywords")
     parser.add_argument("-u", "--url", metavar="URL",
                         help="Use twitter users from any links in web page at url")
     parser.add_argument("-f", "--file", metavar="FILE",
                         help="Use twitter user ids from file")
-    parser.add_argument("-n", "--newsheadlines", metavar="SYMBOL",
-                        help="Get news headlines instead of Twitter using stock symbol, example: TSLA")
+    parser.add_argument("-l", "--linksentiment", action="store_true",
+                        help="Follow any link url in tweets and analyze sentiment on web page")
+    parser.add_argument("-n", "--newsheadlines", action="store_true",
+                        help="Get news headlines instead of Twitter using stock symbol from -s")
     parser.add_argument("--frequency", metavar="FREQUENCY", default=120, type=int,
                         help="How often in seconds to retrieve news headlines (default: 120 sec)")
     parser.add_argument("--followlinks", action="store_true",
-                        help="Follow links on news headlines and scrape relevant text from landing page")
+                        help="Follow links on news headlines and scrape relevant text from landing page") 
+    parser.add_argument("-w", "--websentiment", action="store_true",
+                        help="Get sentiment results from text processing website")                  
+    parser.add_argument("--overridetokensreq", metavar="TOKEN", nargs="+",
+                        help="Override nltk required tokens from config, separate with space")
+    parser.add_argument("--overridetokensignore", metavar="TOKEN", nargs="+",
+                        help="Override nltk ignore tokens from config, separate with space")
     parser.add_argument("-v", "--verbose", action="store_true",
                        help="Increase output verbosity")
     parser.add_argument("--debug", action="store_true",
@@ -554,20 +723,20 @@ if __name__ == '__main__':
             color = '35m'
 
         banner = """\033[%s
-        
-             /$$                         /$$                 /$$           /$$         /$$    
-            | $$                        | $$                |__/          | $$        | $$    
-  /$$$$$$$ /$$$$$$    /$$$$$$   /$$$$$$$| $$   /$$  /$$$$$$$ /$$  /$$$$$$ | $$$$$$$  /$$$$$$  
- /$$_____/|_  $$_/   /$$__  $$ /$$_____/| $$  /$$/ /$$_____/| $$ /$$__  $$| $$__  $$|_  $$_/  
-|  $$$$$$   | $$    | $$  \ $$| $$      | $$$$$$/ |  $$$$$$ | $$| $$  \ $$| $$  \ $$  | $$    
- \____  $$  | $$ /$$| $$  | $$| $$      | $$_  $$  \____  $$| $$| $$  | $$| $$  | $$  | $$ /$$
- /$$$$$$$/  |  $$$$/|  $$$$$$/|  $$$$$$$| $$ \  $$ /$$$$$$$/| $$|  $$$$$$$| $$  | $$  |  $$$$/
-|_______/    \___/   \______/  \_______/|__/  \__/|_______/ |__/ \____  $$|__/  |__/   \___/  
-                                                                 /$$  \ $$                    
-                       :) = +$   :( = -$                        |  $$$$$$/                    
-                                                                 \______/  v%s
-        \033[0m""" % (color, STOCKSIGHT_VERSION)
+       _                     _                 
+     _| |_ _           _   _| |_ _     _   _   
+    |   __| |_ ___ ___| |_|   __|_|___| |_| |_ 
+    |__   |  _| . |  _| '_|__   | | . |   |  _|
+    |_   _|_| |___|___|_,_|_   _|_|_  |_|_|_|  
+      |_|                   |_|   |___|                
+          :) = +$   :( = -$    v%s
+     https://github.com/shirosaidev/stocksight
+            \033[0m""" % (color, STOCKSIGHT_VERSION)
         print(banner + '\n')
+
+    # create instance of elasticsearch
+    es = Elasticsearch(hosts=[{'host': elasticsearch_host, 'port': elasticsearch_port}],
+                http_auth=(elasticsearch_user, elasticsearch_password))
 
     # set up elasticsearch mappings and create index
     mappings = {
@@ -684,6 +853,7 @@ if __name__ == '__main__':
             }
         }
     }
+
     if args.delindex:
         logger.info('Deleting existing Elasticsearch index ' + args.index)
         es.indices.delete(index=args.index, ignore=[400, 404])
@@ -691,14 +861,20 @@ if __name__ == '__main__':
     logger.info('Creating new Elasticsearch index or using existing ' + args.index)
     es.indices.create(index=args.index, body=mappings, ignore=[400, 404])
 
+    # check if we need to override any tokens
+    if args.overridetokensreq:
+        nltk_tokens_required = tuple(args.overridetokensreq)
+    if args.overridetokensignore:
+        nltk_tokens_ignored = tuple(args.overridetokensignore)
+
     # are we grabbing news headlines from yahoo finance or twitter
     if args.newsheadlines:
         try:
-            url = "https://finance.yahoo.com/quote/%s/?p=%s" % (args.newsheadlines, args.newsheadlines)
+            url = "https://finance.yahoo.com/quote/%s/?p=%s" % (args.symbol, args.symbol)
 
             logger.info('NLTK tokens required: ' + str(nltk_tokens_required))
             logger.info('NLTK tokens ignored: ' + str(nltk_tokens_ignored))
-            logger.info("Scraping news for %s from %s ..." % (args.newsheadlines, url))
+            logger.info("Scraping news for %s from %s ..." % (args.symbol, url))
 
             # create instance of NewsHeadlineListener
             newslistener = NewsHeadlineListener(url, args.frequency)
@@ -735,24 +911,24 @@ if __name__ == '__main__':
             else:
                 logger.info("No twitter users found in file, exiting")
                 sys.exit(1)
-        else:
+        elif args.keywords is None:
             # build user id list from user names
-            logger.info("Looking up Twitter user ids from usernames...")
+            logger.info("Looking up Twitter user ids from usernames... (use -f twitteruserids.txt for cached user ids)")
             useridlist = []
             while True:
                 for u in twitter_feeds:
                     try:
                         # get user id from screen name using twitter api
                         user = api.get_user(screen_name=u)
-                        uid = int(user.id)
+                        uid = str(user.id)
                         if uid not in useridlist:
                             useridlist.append(uid)
-                        time.sleep(randint(0, 2))
+                        time.sleep(randrange(2, 5))
                     except TweepError as te:
                         # sleep a bit in case twitter suspends us
                         logger.warning("Tweepy exception: twitter api error caused by: %s" % te)
                         logger.info("Sleeping for a random amount of time and retrying...")
-                        time.sleep(randint(1,10))
+                        time.sleep(randrange(2,30))
                         continue
                     except KeyboardInterrupt:
                         logger.info("Ctrl-c keyboard interrupt, exiting...")
@@ -778,21 +954,25 @@ if __name__ == '__main__':
 
         try:
             # search twitter for keywords
+            logger.info('Stock symbol: ' + str(args.symbol))
             logger.info('NLTK tokens required: ' + str(nltk_tokens_required))
             logger.info('NLTK tokens ignored: ' + str(nltk_tokens_ignored))
-            logger.info('Twitter Feeds: ' + str(twitter_feeds))
-            logger.info('Twitter User Ids: ' + str(useridlist))
-            logger.info('Twitter keywords: ' + str(args.keywords))
             logger.info('Listening for Tweets (ctrl-c to exit)...')
             if args.keywords is None:
+                logger.info('No keywords entered, following Twitter users...')
+                logger.info('Twitter Feeds: ' + str(twitter_feeds))
+                logger.info('Twitter User Ids: ' + str(useridlist))
                 stream.filter(follow=useridlist, languages=['en'])
             else:
                 # keywords to search on twitter
                 # add keywords to list
                 keywords = args.keywords.split(',')
-                # add tokens to keywords to list
-                for f in nltk_tokens_required:
-                    keywords.append(f)
+                if args.addtokens:
+                    # add tokens to keywords to list
+                    for f in nltk_tokens_required:
+                        keywords.append(f)
+                logger.info('Searching Twitter for keywords...')
+                logger.info('Twitter keywords: ' + str(keywords))
                 stream.filter(track=keywords, languages=['en'])
         except TweepError as te:
             logger.debug("Tweepy Exception: Failed to get tweets caused by: %s" % te)
